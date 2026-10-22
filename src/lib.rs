@@ -22,7 +22,9 @@ use libc::c_char;
 use mesh::Mesh;
 use std::error::Error;
 use std::ffi::CStr;
-use std::{io, panic, slice, thread, time};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, OnceLock};
+use std::{io, panic, ptr, thread, time};
 
 #[cfg(target_os = "linux")]
 use std::env;
@@ -58,8 +60,8 @@ fn print_context_info(display: &glium::backend::Context) {
 
 fn create_normal_display(
     config: &Config,
-) -> Result<(glium::Display, EventLoop<()>), Box<dyn Error>> {
-    let event_loop = EventLoop::new();
+    event_loop: &EventLoop<()>,
+) -> Result<glium::Display, Box<dyn Error>> {
     let window_dim = PhysicalSize::new(config.width, config.height);
     let window = glutin::window::WindowBuilder::new()
         .with_title("stl-thumb")
@@ -70,19 +72,83 @@ fn create_normal_display(
     let cb = glutin::ContextBuilder::new().with_depth_buffer(24);
     //.with_multisampling(8);
     //.with_gl(glutin::GlRequest::Specific(glutin::Api::OpenGlEs, (2, 0)));
-    let display = glium::Display::new(window, cb, &event_loop)?;
+    let display = glium::Display::new(window, cb, event_loop)?;
     print_context_info(&display);
-    Ok((display, event_loop))
+    Ok(display)
+}
+
+// winit allows only one event loop per process, so it can't be made per render.
+// Instead one long-lived thread owns it and does all the offscreen rendering.
+type RenderJob = Box<dyn FnOnce(Option<&EventLoop<()>>) + Send>;
+
+fn render_thread() -> &'static Mutex<Sender<RenderJob>> {
+    static RENDER_THREAD: OnceLock<Mutex<Sender<RenderJob>>> = OnceLock::new();
+    RENDER_THREAD.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<RenderJob>();
+        thread::Builder::new()
+            .name("stl-thumb-render".to_string())
+            .spawn(move || {
+                // Workaround for issues with OpenGL 3.1 on Mesa 18.3.
+                // Done once, before any GL, and never over a value the user set.
+                #[cfg(target_os = "linux")]
+                if env::var_os("MESA_GL_VERSION_OVERRIDE").is_none() {
+                    env::set_var("MESA_GL_VERSION_OVERRIDE", "2.1");
+                }
+                let event_loop = create_event_loop();
+                for job in receiver {
+                    job(event_loop.as_ref());
+                }
+            })
+            .expect("Unable to start render thread");
+        Mutex::new(sender)
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn create_headless_display(config: &Config) -> Result<glium::HeadlessRenderer, Box<dyn Error>> {
+fn create_event_loop() -> Option<EventLoop<()>> {
     use glium::glutin::platform::windows::EventLoopBuilderExtWindows;
 
-    let event_loop: EventLoop<()> = EventLoopBuilder::new().with_any_thread(true).build();
+    Some(EventLoopBuilder::new().with_any_thread(true).build())
+}
+
+#[cfg(target_os = "linux")]
+fn create_event_loop() -> Option<EventLoop<()>> {
+    use glium::glutin::platform::unix::EventLoopBuilderExtUnix;
+
+    // If there is no X server or Wayland, creating the event loop panics.
+    // Without one only osmesa software rendering is possible.
+    // TODO: Submit PR upstream to stop panicing
+    match panic::catch_unwind(|| EventLoopBuilder::new().with_any_thread(true).build()) {
+        Ok(event_loop) => Some(event_loop),
+        Err(e) => {
+            warn!(
+                "No Wayland or X server. Falling back to osmesa software rendering. Reason {:?}",
+                panic_message(&e)
+            );
+            None
+        }
+    }
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_headless_display(
+    config: &Config,
+    event_loop: Option<&EventLoop<()>>,
+) -> Result<glium::HeadlessRenderer, Box<dyn Error>> {
+    let event_loop = event_loop.ok_or("No event loop")?;
     let size = PhysicalSize::new(config.width, config.height);
     let cb = glutin::ContextBuilder::new();
-    let context = cb.build_headless(&event_loop, size)?;
+    let context = cb.build_headless(event_loop, size)?;
 
     let context = unsafe { context.treat_as_current() };
     let display = glium::backend::glutin::headless::Headless::new(context)?;
@@ -91,49 +157,37 @@ fn create_headless_display(config: &Config) -> Result<glium::HeadlessRenderer, B
 }
 
 #[cfg(target_os = "linux")]
-fn create_headless_display(config: &Config) -> Result<glium::HeadlessRenderer, Box<dyn Error>> {
-    use glium::glutin::platform::unix::{EventLoopBuilderExtUnix, HeadlessContextExt};
+fn create_headless_display(
+    config: &Config,
+    event_loop: Option<&EventLoop<()>>,
+) -> Result<glium::HeadlessRenderer, Box<dyn Error>> {
+    use glium::glutin::platform::unix::HeadlessContextExt;
 
     let size = PhysicalSize::new(config.width, config.height);
     let cb = glutin::ContextBuilder::new();
-    let context: glium::glutin::Context<glium::glutin::NotCurrent>;
 
     // Linux requires an elaborate chain of attempts and fallbacks to find the ideal type of opengl context.
-
-    // If there is no X server or Wayland, creating the event loop will fail first.
-    // If this happens we catch the panic and fall back to osmesa software rendering, which doesn't require an event loop.
-    // TODO: Submit PR upstream to stop panicing
-    let event_loop_result: Result<EventLoop<()>, _> =
-        panic::catch_unwind(|| EventLoopBuilder::new().with_any_thread(true).build());
-
-    match event_loop_result {
-        Ok(event_loop) => {
-            context = {
-                // Try surfaceless, headless, and osmesa in that order
-                // This is the procedure recommended in
-                // https://github.com/rust-windowing/glutin/blob/bab33a84dfb094ff65c059400bed7993434638e2/glutin_examples/examples/headless.rs
-                match cb.clone().build_surfaceless(&event_loop) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("Unable to create surfaceless GL context. Trying headless instead. Reason: {:?}", e);
-                        match cb.clone().build_headless(&event_loop, size) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Unable to create headless GL context. Trying osmesa software renderer instead. Reason: {:?}", e);
-                                cb.build_osmesa(size)?
-                            }
+    let context: glium::glutin::Context<glium::glutin::NotCurrent> = match event_loop {
+        Some(event_loop) => {
+            // Try surfaceless, headless, and osmesa in that order
+            // This is the procedure recommended in
+            // https://github.com/rust-windowing/glutin/blob/bab33a84dfb094ff65c059400bed7993434638e2/glutin_examples/examples/headless.rs
+            match cb.clone().build_surfaceless(event_loop) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Unable to create surfaceless GL context. Trying headless instead. Reason: {:?}", e);
+                    match cb.clone().build_headless(event_loop, size) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Unable to create headless GL context. Trying osmesa software renderer instead. Reason: {:?}", e);
+                            cb.build_osmesa(size)?
                         }
                     }
                 }
-            };
+            }
         }
-        Err(e) => {
-            warn!(
-                "No Wayland or X server. Falling back to osmesa software rendering. Reason {:?}",
-                e
-            );
-            context = cb.build_osmesa(size)?;
-        }
+        // No X server or Wayland, which doesn't stop osmesa
+        None => cb.build_osmesa(size)?,
     };
 
     let context = unsafe { context.treat_as_current() };
@@ -148,7 +202,7 @@ fn render_pipeline<F>(
     mesh: &Mesh,
     framebuffer: &mut glium::framebuffer::SimpleFrameBuffer,
     texture: &glium::Texture2d,
-) -> image::DynamicImage
+) -> Result<image::DynamicImage, Box<dyn Error>>
 where
     F: Facade,
 {
@@ -176,17 +230,16 @@ where
     let program = match program {
         Ok(p) => p,
         Err(glium::CompilationError(err, _)) => {
-            error!("{}", err);
-            panic!("Compiling shaders");
+            return Err(format!("Compiling shaders: {}", err).into());
         }
-        Err(err) => panic!("{}", err),
+        Err(err) => return Err(err.into()),
     };
 
     // Send mesh data to GPU
     // ---------------------
 
-    let vertex_buf = glium::VertexBuffer::new(display, &mesh.vertices).unwrap();
-    let normal_buf = glium::VertexBuffer::new(display, &mesh.normals).unwrap();
+    let vertex_buf = glium::VertexBuffer::new(display, &mesh.vertices)?;
+    let normal_buf = glium::VertexBuffer::new(display, &mesh.normals)?;
     // Can use NoIndices here because STLs are dumb
     let indices = glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList);
 
@@ -237,29 +290,29 @@ where
     let fxaa = fxaa::FxaaSystem::new(display);
     let fxaa_enable = matches!(config.aamethod, AAMethod::FXAA);
 
+    let mut draw_result = Ok(());
     fxaa::draw(&fxaa, framebuffer, fxaa_enable, |target| {
         // Fills background color and clears depth buffer
         target.clear_color_and_depth(config.background, 1.0);
-        target
-            .draw(
-                (&vertex_buf, &normal_buf),
-                indices,
-                &program,
-                &uniforms,
-                &params,
-            )
-            .unwrap();
+        draw_result = target.draw(
+            (&vertex_buf, &normal_buf),
+            indices,
+            &program,
+            &uniforms,
+            &params,
+        );
         // TODO: Shadows
     });
+    draw_result?;
 
     // Convert Image
     // =============
 
     let pixels: glium::texture::RawImage2d<u8> = texture.read();
     let img = image::ImageBuffer::from_raw(config.width, config.height, pixels.data.into_owned())
-        .unwrap();
+        .ok_or("Rendered image has the wrong size")?;
 
-    image::DynamicImage::ImageRgba8(img).flipv()
+    Ok(image::DynamicImage::ImageRgba8(img).flipv())
 }
 
 pub fn render_to_window(config: Config) -> Result<(), Box<dyn Error>> {
@@ -269,13 +322,14 @@ pub fn render_to_window(config: Config) -> Result<(), Box<dyn Error>> {
 
     // Create GL context
     // =================
-    let (display, event_loop) = create_normal_display(&config)?;
+    let event_loop = EventLoop::new();
+    let display = create_normal_display(&config, &event_loop)?;
 
     let sleep_time = time::Duration::from_millis(10);
 
-    let texture = glium::Texture2d::empty(&display, config.width, config.height).unwrap();
+    let texture = glium::Texture2d::empty(&display, config.width, config.height)?;
     let depthtexture =
-        glium::texture::DepthTexture2d::empty(&display, config.width, config.height).unwrap();
+        glium::texture::DepthTexture2d::empty(&display, config.width, config.height)?;
 
     event_loop.run(move |ev, _, control_flow| {
         *control_flow =
@@ -296,12 +350,21 @@ pub fn render_to_window(config: Config) -> Result<(), Box<dyn Error>> {
                 return;
             }
             glutin::event::Event::NewEvents(glutin::event::StartCause::Init) => {
-                render_pipeline(&display, &config, &mesh, &mut framebuffer, &texture);
+                if let Err(e) =
+                    render_pipeline(&display, &config, &mesh, &mut framebuffer, &texture)
+                {
+                    error!("Application error: {}", e);
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
             }
             _ => (),
         }
 
-        let target = display.draw();
+        let mut target = display.draw();
+        // Clearing with color_srgb false turns off sRGB conversion, which the model's
+        // program left on. Otherwise the blit would brighten the image, unlike saved ones.
+        target.clear(None, Some((0.0, 0.0, 0.0, 0.0)), false, None, None);
         target.blit_from_simple_framebuffer(
             &framebuffer,
             &glium::Rect {
@@ -327,56 +390,85 @@ pub fn render_to_image(config: &Config) -> Result<image::DynamicImage, Box<dyn E
     // =========================
     let mesh = Mesh::load(&config.model_filename, config.recalc_normals)?;
 
+    // Render on the render thread. A panic there (OpenGL problems) becomes an error here.
+    let config = config.clone();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let job: RenderJob = Box::new(move |event_loop| {
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            render_offscreen(&config, &mesh, event_loop).map_err(|e| e.to_string())
+        }))
+        .unwrap_or_else(|e| Err(format!("Renderer panicked: {}", panic_message(&e))));
+        let _ = result_sender.send(result);
+    });
+    render_thread()
+        .lock()
+        .map_err(|_| "Render thread is unavailable")?
+        .send(job)
+        .map_err(|_| "Render thread has stopped")?;
+    let img = result_receiver
+        .recv()
+        .map_err(|_| "Render thread has stopped")??;
+
+    Ok(img)
+}
+
+fn render_offscreen(
+    config: &Config,
+    mesh: &Mesh,
+    event_loop: Option<&EventLoop<()>>,
+) -> Result<image::DynamicImage, Box<dyn Error>> {
     // Create GL context
     // =================
     // 1. If not visible create a headless context.
     // 2. If headless context creation fails, create a normal context with a hidden window.
-    let img: image::DynamicImage = match create_headless_display(config) {
+    match create_headless_display(config, event_loop) {
         Ok(display) => {
-            let texture = glium::Texture2d::empty(&display, config.width, config.height).unwrap();
+            let texture = glium::Texture2d::empty(&display, config.width, config.height)?;
             let depthtexture =
-                glium::texture::DepthTexture2d::empty(&display, config.width, config.height)
-                    .unwrap();
+                glium::texture::DepthTexture2d::empty(&display, config.width, config.height)?;
             let mut framebuffer = glium::framebuffer::SimpleFrameBuffer::with_depth_buffer(
                 &display,
                 &texture,
                 &depthtexture,
-            )
-            .unwrap();
-            render_pipeline(&display, config, &mesh, &mut framebuffer, &texture)
+            )?;
+            render_pipeline(&display, config, mesh, &mut framebuffer, &texture)
         }
         Err(e) => {
             warn!(
                 "Unable to create headless GL context. Trying hidden window instead. Reason: {:?}",
                 e
             );
-            let (display, _) = create_normal_display(config)?;
-            let texture = glium::Texture2d::empty(&display, config.width, config.height).unwrap();
+            let event_loop = event_loop.ok_or("No GL context and no display for a window")?;
+            let display = create_normal_display(config, event_loop)?;
+            let texture = glium::Texture2d::empty(&display, config.width, config.height)?;
             let depthtexture =
-                glium::texture::DepthTexture2d::empty(&display, config.width, config.height)
-                    .unwrap();
+                glium::texture::DepthTexture2d::empty(&display, config.width, config.height)?;
             let mut framebuffer = glium::framebuffer::SimpleFrameBuffer::with_depth_buffer(
                 &display,
                 &texture,
                 &depthtexture,
-            )
-            .unwrap();
-            render_pipeline(&display, config, &mesh, &mut framebuffer, &texture)
+            )?;
+            render_pipeline(&display, config, mesh, &mut framebuffer, &texture)
         }
-    };
+    }
+}
 
-    Ok(img)
+// JPEG has no transparency: blend transparent parts onto white
+fn remove_alpha(img: &image::DynamicImage) -> image::DynamicImage {
+    let rgba = img.to_rgba8();
+    let rgb = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba.get_pixel(x, y).0;
+        let a = p[3] as u32;
+        image::Rgb([0, 1, 2].map(|i| ((p[i] as u32 * a + 255 * (255 - a) + 127) / 255) as u8))
+    });
+    image::DynamicImage::ImageRgb8(rgb)
 }
 
 pub fn render_to_file(config: &Config) -> Result<(), Box<dyn Error>> {
-    let img = render_to_image(config)?;
-
-    // Choose output
-    // Write to stdout if user did not specify a file
-    let mut output: Box<dyn io::Write> = match config.img_filename.as_str() {
-        "-" => Box::new(io::stdout()),
-        _ => Box::new(std::fs::File::create(&config.img_filename).unwrap()),
-    };
+    let mut img = render_to_image(config)?;
+    if config.format == ImageFormat::Jpeg {
+        img = remove_alpha(&img);
+    }
 
     // write_to() requires a seekable writer for performance reasons.
     // So we create an in-memory buffer and then dump that to the output.
@@ -397,8 +489,8 @@ pub fn render_to_file(config: &Config) -> Result<(), Box<dyn Error>> {
             );
             encoder.write_image(
                 img.as_bytes(),
-                config.width,
-                config.height,
+                img.width(),
+                img.height(),
                 img.color().into(),
             )?;
         }
@@ -406,6 +498,12 @@ pub fn render_to_file(config: &Config) -> Result<(), Box<dyn Error>> {
     }
     //img.write_to(&mut cursor, config.format.to_owned())?;
 
+    // Choose output
+    // Write to stdout if user did not specify a file
+    let mut output: Box<dyn io::Write> = match config.img_filename.as_str() {
+        "-" => Box::new(io::stdout()),
+        _ => Box::new(std::fs::File::create(&config.img_filename)?),
+    };
     output.write_all(&buff)?;
     output.flush()?;
 
@@ -428,15 +526,15 @@ pub fn render_to_file(config: &Config) -> Result<(), Box<dyn Error>> {
 /// int width = 256;
 /// int height = 256;
 ///
-/// int img_size = width * height * 4;
-/// buf_ptr = (uchar *) malloc(img_size);
+/// size_t img_size = (size_t)width * height * 4;
+/// uint8_t *buf_ptr = malloc(img_size);
 ///
 /// render_to_buffer(buf_ptr, width, height, model_filename_c);
 /// ```
 ///
 /// # Safety
 ///
-/// * `buf_ptr` _must_ point to a valid initialized buffer, at least `width * height * 4` bytes long.
+/// * `buf_ptr` _must_ point to a buffer that is valid for writes of `width * height * 4` bytes.
 /// * `model_filename_c` must point to a valid null-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn render_to_buffer(
@@ -445,17 +543,37 @@ pub unsafe extern "C" fn render_to_buffer(
     height: u32,
     model_filename_c: *const c_char,
 ) -> bool {
-    // Workaround for issues with OpenGL 3.1 on Mesa 18.3
-    #[cfg(target_os = "linux")]
-    env::set_var("MESA_GL_VERSION_OVERRIDE", "2.1");
+    // Never let a panic unwind into the caller
+    panic::catch_unwind(panic::AssertUnwindSafe(|| unsafe {
+        render_to_buffer_inner(buf_ptr, width, height, model_filename_c)
+    }))
+    .unwrap_or_else(|e| {
+        error!("Application error: {}", panic_message(&e));
+        false
+    })
+}
 
+unsafe fn render_to_buffer_inner(
+    buf_ptr: *mut u8,
+    width: u32,
+    height: u32,
+    model_filename_c: *const c_char,
+) -> bool {
     // Check that the buffer pointer is valid
     if buf_ptr.is_null() {
         error!("Image buffer pointer is null");
         return false;
     };
-    let buf_size = (width * height * 4) as usize;
-    let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, buf_size) };
+    if width == 0 || height == 0 || width > config::MAX_SIZE || height > config::MAX_SIZE {
+        error!(
+            "Invalid image size {}x{} (each side must be 1 to {})",
+            width,
+            height,
+            config::MAX_SIZE
+        );
+        return false;
+    }
+    let buf_size = width as usize * height as usize * 4;
 
     // Check validity of provided file path string
     let model_filename_cstr = unsafe {
@@ -482,22 +600,20 @@ pub unsafe extern "C" fn render_to_buffer(
     };
 
     // Render
-
-    // Run renderer in seperate thread so OpenGL problems do not crash caller
-    let render_thread = thread::spawn(move || render_to_image(&config).unwrap());
-
-    let img = match render_thread.join() {
-        Ok(s) => s,
+    let img = match render_to_image(&config) {
+        Ok(img) => img,
         Err(e) => {
-            error!("Application error: {:?}", e);
+            error!("Application error: {}", e);
             return false;
         }
     };
 
     // Copy image to output buffer
     match img.as_rgba8() {
-        Some(s) => buf.copy_from_slice(s),
-        None => {
+        Some(s) if s.len() == buf_size => unsafe {
+            ptr::copy_nonoverlapping(s.as_ptr(), buf_ptr, buf_size)
+        },
+        _ => {
             error!("Unable to get image");
             return false;
         }

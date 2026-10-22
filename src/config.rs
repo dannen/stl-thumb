@@ -2,6 +2,9 @@ use image::ImageFormat;
 use std::f32;
 use std::path::Path;
 
+// Largest thumbnail side, in pixels. Common GPUs limit textures to this.
+pub const MAX_SIZE: u32 = 16384;
+
 #[derive(Clone)]
 pub struct Material {
     pub ambient: [f32; 3],
@@ -60,7 +63,7 @@ impl Config {
             .author(env!("CARGO_PKG_AUTHORS"))
             .arg(
                 clap::Arg::new("MODEL_FILE")
-                    .help("STL file. Use - to read from stdin instead of a file.")
+                    .help("3D model file (STL, OBJ or 3MF). Use - to read from stdin instead of a file.")
                     .required(true)
                     .index(1),
             )
@@ -83,13 +86,14 @@ impl Config {
                     .short('s')
                     .long("size")
                     .action(clap::ArgAction::Set)
+                    .value_parser(clap::value_parser!(u32).range(1..=MAX_SIZE as i64))
                     .required(false)
             )
             .arg(
                 clap::Arg::new("visible")
                     .help("Display the thumbnail in a window instead of saving a file")
                     .short('x')
-                    .required(false)
+                    .action(clap::ArgAction::SetTrue)
             )
             .arg(
                 clap::Arg::new("verbosity")
@@ -103,13 +107,15 @@ impl Config {
                     .short('m')
                     .long("material")
                     .value_names(["ambient","diffuse","specular"])
+                    .value_parser(html_to_rgb)
             )
             .arg(
                 clap::Arg::new("background")
-                    .help("The background color with transparency (rgba). Default is ffffff00.")
+                    .help("The background color with transparency (rgba hex, or rgb hex for opaque). Default is 00000000 (transparent). JPEG images, which have no transparency, show transparent parts as white.")
                     .short('b')
                     .long("background")
                     .action(clap::ArgAction::Set)
+                    .value_parser(html_to_rgba)
                     .required(false)
             )
             .arg(
@@ -123,6 +129,7 @@ impl Config {
                 clap::Arg::new("recalc_normals")
                     .help("Force recalculation of face normals. Use when dealing with malformed STL files.")
                     .long("recalc-normals")
+                    .action(clap::ArgAction::SetTrue)
             )
             .get_matches();
 
@@ -139,32 +146,32 @@ impl Config {
         match matches.get_one::<String>("format") {
             Some(x) => c.format = match_format(x),
             None => {
-                if let Some(ext) = Path::new(&c.img_filename).extension() {
-                    c.format = match_format(ext.to_str().unwrap());
+                if let Some(ext) = Path::new(&c.img_filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                {
+                    c.format = match_format(ext);
                 }
             }
         };
 
-        if let Some(x) = matches.get_one::<String>("size") {
-            c.width = x.parse::<u32>().expect("Invalid size");
+        if let Some(&x) = matches.get_one::<u32>("size") {
+            c.width = x;
+            c.height = x;
         }
 
-        if let Some(x) = matches.get_one::<String>("size") {
-            c.height = x.parse::<u32>().expect("Invalid size");
-        }
-
-        c.visible = matches.contains_id("visible");
+        c.visible = matches.get_flag("visible");
         c.verbosity = matches.get_count("verbosity") as usize;
-        if let Some(materials) = matches.get_many::<String>("material") {
-            let mut iter = materials.map(|m| html_to_rgb(m));
+        if let Some(materials) = matches.get_many::<[f32; 3]>("material") {
+            let mut iter = materials.copied();
             c.material = Material {
                 ambient: iter.next().unwrap_or([0.0, 0.0, 0.0]),
                 diffuse: iter.next().unwrap_or([0.0, 0.0, 0.0]),
                 specular: iter.next().unwrap_or([0.0, 0.0, 0.0]),
             };
         }
-        if let Some(x) = matches.get_one::<String>("background") {
-            c.background = html_to_rgba(x);
+        if let Some(&x) = matches.get_one::<(f32, f32, f32, f32)>("background") {
+            c.background = x;
         }
         if let Some(x) = matches.get_one::<String>("aamethod") {
             match x.as_str() {
@@ -173,7 +180,7 @@ impl Config {
                 _ => unreachable!(),
             }
         }
-        c.recalc_normals = matches.contains_id("recalc_normals");
+        c.recalc_normals = matches.get_flag("recalc_normals");
 
         c
     }
@@ -193,17 +200,52 @@ fn match_format(ext: &str) -> ImageFormat {
     }
 }
 
-fn html_to_rgb(color: &str) -> [f32; 3] {
-    let r: f32 = u8::from_str_radix(&color[0..2], 16).expect("Invalid color") as f32 / 255.0;
-    let g: f32 = u8::from_str_radix(&color[2..4], 16).expect("Invalid color") as f32 / 255.0;
-    let b: f32 = u8::from_str_radix(&color[4..6], 16).expect("Invalid color") as f32 / 255.0;
-    [r, g, b]
+// Parse "rrggbb" or "rrggbbaa" (optionally starting with #) into 0.0-1.0 channels
+fn parse_hex_color(color: &str) -> Result<Vec<f32>, String> {
+    let hex = color.strip_prefix('#').unwrap_or(color);
+    if !(hex.len() == 6 || hex.len() == 8) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid color {:?}: expected hex digits like ff8800 or ff880080",
+            color
+        ));
+    }
+    Ok((0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f32 / 255.0)
+        .collect())
 }
 
-fn html_to_rgba(color: &str) -> (f32, f32, f32, f32) {
-    let r: f32 = u8::from_str_radix(&color[0..2], 16).expect("Invalid color") as f32 / 255.0;
-    let g: f32 = u8::from_str_radix(&color[2..4], 16).expect("Invalid color") as f32 / 255.0;
-    let b: f32 = u8::from_str_radix(&color[4..6], 16).expect("Invalid color") as f32 / 255.0;
-    let a: f32 = u8::from_str_radix(&color[6..8], 16).expect("Invalid color") as f32 / 255.0;
-    (r, g, b, a)
+fn html_to_rgb(color: &str) -> Result<[f32; 3], String> {
+    match parse_hex_color(color)?[..] {
+        [r, g, b] => Ok([r, g, b]),
+        _ => Err(format!(
+            "invalid color {:?}: expected rgb hex like ff8800",
+            color
+        )),
+    }
+}
+
+fn html_to_rgba(color: &str) -> Result<(f32, f32, f32, f32), String> {
+    match parse_hex_color(color)?[..] {
+        [r, g, b] => Ok((r, g, b, 1.0)),
+        [r, g, b, a] => Ok((r, g, b, a)),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_colors() {
+        assert_eq!(html_to_rgb("ff0000").unwrap(), [1.0, 0.0, 0.0]);
+        assert_eq!(html_to_rgb("#00ff00").unwrap(), [0.0, 1.0, 0.0]);
+        assert_eq!(html_to_rgba("0000ff").unwrap(), (0.0, 0.0, 1.0, 1.0));
+        assert_eq!(html_to_rgba("ffffff00").unwrap(), (1.0, 1.0, 1.0, 0.0));
+        assert!(html_to_rgb("fff").is_err());
+        assert!(html_to_rgb("ff0000ff").is_err());
+        assert!(html_to_rgba("zzzzzz").is_err());
+        assert!(html_to_rgba("éééé").is_err());
+    }
 }

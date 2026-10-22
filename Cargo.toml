@@ -35,14 +35,10 @@ mint = "0.5.9"
 stderrlog = "0.6.0"
 stl_io = "0.8.0"
 tobj = "4.0.2"
-winit = "0.30.3"
 threemf = "0.6.0"
 
 #[patch.crates-io]
 #glutin = { git = "https://github.com/rust-windowing/glutin.git", rev = "07c461e" }
-
-[build-dependencies]
-cbindgen = "0.27.*"
 
 [dev-dependencies]
 criterion = "0.5.1"
@@ -61,7 +57,9 @@ harness = false
 
 [package.metadata.deb]
 license-file = ["LICENSE", "3"]
-depends = "libgl1, libc6, libgcc1, libosmesa6-dev"
+# libosmesa6-dev: osmesa is loaded as the unversioned libOSMesa.so, which only the -dev package has.
+# xvfb: the thumbnailer entries run stl-thumb through xvfb-run.
+depends = "libgl1, libc6, libgcc1, libosmesa6-dev, xvfb"
 extended-description = """\
 Stl-thumb is a fast lightweight thumbnail generator for 3D model(STL, OBJ, 3MF) files. \
 It can show previews for 3D model files in your file manager on Linux and Windows. \
@@ -88,3 +86,7 @@ assets = [
     { source = "stl-thumb-mime.xml",                dest = "/usr/share/mime/packages/stl-thumb-mime.xml",       mode = "644" },
     { source = "README.md",                         dest = "/usr/share/doc/stl-thumb/README.md",    doc = true, mode = "644" }
 ]
+
+[package.metadata.generate-rpm.requires]
+# The thumbnailer entries run stl-thumb through xvfb-run
+xorg-x11-server-Xvfb = "*"

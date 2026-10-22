@@ -60,6 +60,8 @@ vec4 fxaa(sampler2D tex, vec2 fragCoord, vec2 resolution,
     float alphaAA = texture2D(tex, coordAA).a;
     float alphaAB = texture2D(tex, coordAB).a;
     float alphaATotal = alphaAA + alphaAB;
+    // Fully transparent samples (background) would divide by zero
+    alphaATotal = max(alphaATotal, 1e-6);
     float weightAA = alphaAA / alphaATotal;
     float weightAB = alphaAB / alphaATotal;
     vec4 rgbA = vec4( // Multiply by 2
@@ -71,7 +73,7 @@ vec4 fxaa(sampler2D tex, vec2 fragCoord, vec2 resolution,
     vec2 coordBD = fragCoord * inverseVP + dir * 0.5;
     float alphaBC = texture2D(tex, coordBC).a;
     float alphaBD = texture2D(tex, coordBD).a;
-    float alphaBTotal = alphaAA + alphaAB + alphaBC + alphaBD;
+    float alphaBTotal = max(alphaAA + alphaAB + alphaBC + alphaBD, 1e-6);
     float weightBA = alphaAA / alphaBTotal;
     float weightBB = alphaAB / alphaBTotal;
     float weightBC = alphaBC / alphaBTotal;

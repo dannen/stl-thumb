@@ -85,10 +85,10 @@ $ stl-thumb <MODEL_FILE> [IMG_FILE]
 | ------------- |---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | <MODEL_FILE>    | The model file you want a picture of. Use - to read from stdin instead of a file.                                                                                                     |
 | <IMG_FILE>    | The thumbnail image file that will be created. Use - to write to stdout instead of a file.                                                                                            |
-| -s, --size \<size\>   | Specify width of the image. It will always be a square.                                                                                                                               |
+| -s, --size \<size\>   | Specify width of the image (1 to 16384 pixels). It will always be a square.                                                                                                           |
 | -f, --format \<format\> | The format of the image file. If not specified it will be determined from the file extension, or default to PNG if there is no extension. Supported formats: PNG, JPEG, GIF, ICO, BMP |
 | -m, --material \<ambient\> \<diffuse\> \<specular\> | Colors for rendering the mesh using the Phong reflection model. Requires 3 colors as rgb hex values: ambient, diffuse, and specular. Defaults to blue.                                |
-| -b, --backround \<color> | The background color with transparency (rgba). Default is ffffff00.                                                                                                                   |
+| -b, --background \<color> | The background color with transparency (rgba hex, or rgb hex for opaque). Default is 00000000 (transparent). JPEG images show transparent parts as white.                         |
 | -a, --antialiasing [none, fxaa] | Anti-aliasing method. Default is FXAA, which is fast but may introduce artifacts.                                                                                                     |
 | --recalc-normals | Force recalculation of face normals. Use when dealing with malformed STL files.                                                                                                       |
 | -x            | Display the image in a window instead of saving a file.                                                                                                                               |
